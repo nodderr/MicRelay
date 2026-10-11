@@ -23,7 +23,7 @@ from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
-from . import __version__, audio_out, netutil
+from . import __version__, audio_out, netutil, vbcable
 from .engine import Engine, EngineSettings, EngineStatus
 from .logs import configure_logging
 from .paths import default_config_dir
@@ -56,10 +56,10 @@ COLORS = {
 
 CABLE_HELP = {
     "win32": (
-        "No virtual cable found, so audio plays to your speakers. Install VB-Cable, "
-        "reboot, and phonemic will use it automatically. Apps then pick “CABLE Output”.",
-        "Get VB-Cable",
-        "https://vb-audio.com/Cable/",
+        "No virtual microphone yet, so audio plays to your speakers. phonemic can install "
+        "the free VB-Cable driver for you; apps then pick “CABLE Output” as their microphone.",
+        "Install virtual mic",
+        "",
     ),
     "darwin": (
         "No virtual cable found, so audio plays to your speakers. Install BlackHole 2ch "
@@ -152,6 +152,13 @@ class PhonemicApp:
         self._shown_url = ""
         self._level_db = -90.0
         self._closing = False
+        # VB-Cable install (Windows): None, "busy", "check", "reboot" or "failed"
+        self._cable_state: str | None = None
+        self._cable_progress = ""
+        self._cable_error: str | None = None
+        self._cable_thread: threading.Thread | None = None
+        self._cable_cancel = threading.Event()
+        self._cable_check_pending = False
         self.px = root.winfo_fpixels("1i") / 96.0  # pixel scale for HiDPI screens
 
         self._setup_window()
@@ -298,7 +305,8 @@ class PhonemicApp:
         self.device_box.bind("<<ComboboxSelected>>", self._on_device_selected)
         if self.settings.null_output:
             self.device_box.configure(state="disabled")
-        self.output_label = ttk.Label(card, text="", style="Muted.Card.TLabel")
+        self.output_label = ttk.Label(card, text="", style="Muted.Card.TLabel", justify="left",
+                                      wraplength=round(330 * self.px))
         self.output_label.grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, gap))
 
         self.buffer_value = ttk.Label(card, text="", style="Card.TLabel", width=7, anchor="e")
@@ -372,6 +380,9 @@ class PhonemicApp:
             self.engine = engine
             self._draw_qr(engine.url)
             log.info("Ready: %s", engine.url)
+        if self._cable_check_pending:
+            self._cable_check_pending = False
+            self._finish_cable_check()
 
     def stop_engine(self) -> None:
         if self._start_thread is not None:
@@ -395,6 +406,7 @@ class PhonemicApp:
         if self._closing:
             return
         self._closing = True
+        self._cable_cancel.set()
         self._save()
         self.stop_engine()
         self.root.destroy()
@@ -464,6 +476,89 @@ class PhonemicApp:
         self.stop_engine()
         self.start_engine()
 
+    # ------------------------------------------------------ VB-Cable install
+    def install_cable(self) -> None:
+        if self._cable_thread is not None:
+            return
+        if not messagebox.askokcancel(
+            "Install virtual mic",
+            "phonemic will download VB-Cable (free donationware by VB-Audio, vb-audio.com) "
+            "and open its installer.\n\n"
+            "1. Click Yes on the Windows prompt.\n"
+            "2. Click “Install Driver” in the VB-Cable window, then close it.\n\n"
+            "phonemic then switches to the new virtual mic by itself.",
+        ):
+            return
+        self._cable_state, self._cable_error = "busy", None
+        self._cable_progress = "Starting…"
+        dest = self.config_dir / "vbcable"
+
+        def work() -> None:
+            try:
+                vbcable.install(dest, self._set_cable_progress, self._cable_cancel)
+            except vbcable.InstallCancelled:
+                self._cable_error = "the Windows admin prompt was declined."
+            except Exception as exc:  # shown in the banner
+                log.exception("VB-Cable install failed")
+                self._cable_error = str(exc)
+
+        self._cable_thread = threading.Thread(target=work, name="vbcable-install", daemon=True)
+        self._cable_thread.start()
+
+    def _set_cable_progress(self, message: str) -> None:
+        self._cable_progress = message  # read by the Tk thread in _show_banners
+
+    def _finish_cable_install(self) -> None:
+        """Called on the Tk thread once the installer has closed."""
+        self._cable_thread = None
+        if self._cable_error is not None:
+            self._cable_state = "failed"
+        elif not self._closing:
+            self.recheck_cable()
+
+    def recheck_cable(self) -> None:
+        """Restart audio with a fresh device list and pick the cable if it is there now."""
+        self._cable_state = "check"
+        self._cable_progress = "Looking for the new virtual mic…"
+        self._set_banner(self.cable_banner, self._cable_progress)  # _refresh skips banners while starting
+        self.stop_engine()
+        try:
+            audio_out.refresh_devices()
+        except RuntimeError as exc:
+            log.warning("%s", exc)
+        self._device_specs = dict(device_options()) if not self.settings.null_output else {AUTO_DEVICE: None}
+        self.device_box.configure(values=list(self._device_specs))
+        self.settings = replace(self.settings, device=None)
+        self.device_var.set(AUTO_DEVICE)
+        self._save()
+        self._cable_check_pending = True
+        self.start_engine()
+
+    def _finish_cable_check(self) -> None:
+        if self.engine is not None and self.engine.status().virtual_device:
+            self._cable_state = None
+            log.info("Virtual cable found after install")
+            messagebox.showinfo(
+                "phonemic",
+                "The virtual mic is ready.\n\n"
+                "In Zoom, Discord, OBS and other apps, choose “CABLE Output” as the microphone.",
+            )
+        else:
+            self._cable_state = "reboot"
+
+    def _cable_banner_content(self) -> tuple[str, str, Callable[[], None] | None]:
+        state = self._cable_state
+        if state in ("busy", "check"):
+            return self._cable_progress, "", None
+        if state == "reboot":
+            return ("VB-Cable is installed, but Windows hasn't added the device yet. Restart "
+                    "Windows to finish, then open phonemic again.", "Check again", self.recheck_cable)
+        if state == "failed":
+            return (f"Installing VB-Cable didn't work: {self._cable_error} You can also install it "
+                    f"by hand from {vbcable.HOMEPAGE}", "Try again", self.install_cable)
+        text, button, _url = CABLE_HELP["win32"]
+        return text, button, self.install_cable
+
     # --------------------------------------------------------------- display
     def _draw_qr(self, url: str) -> None:
         self._shown_url = url
@@ -504,6 +599,8 @@ class PhonemicApp:
         try:
             if self._start_thread is not None and not self._start_thread.is_alive():
                 self._finish_start()
+            if self._cable_thread is not None and not self._cable_thread.is_alive():
+                self._finish_cable_install()
             self._refresh()
         except Exception:  # never let a display glitch kill the refresh loop
             log.exception("Display refresh failed")
@@ -524,7 +621,11 @@ class PhonemicApp:
         self.toggle_button.configure(text="Stop server", style="Stop.TButton")
         self._draw_level(status.level)
         self._show_connection(status)
-        self.output_label.configure(text="→ " + status.output_description)
+        output_text = "→ " + status.output_description
+        if status.output_warning:
+            output_text += "\n" + status.output_warning
+        self.output_label.configure(text=output_text,
+                                    foreground=COLORS["warn"] if status.output_warning else COLORS["muted"])
         self._show_banners(status)
 
     def _show_stopped(self, engine: Engine | None) -> None:
@@ -576,8 +677,11 @@ class PhonemicApp:
         )
 
     def _show_banners(self, status: EngineStatus) -> None:
-        if status.virtual_device or self.settings.device is not None:
+        busy = self._cable_state in ("busy", "check")
+        if not busy and (status.virtual_device or self.settings.device is not None):
             self._set_banner(self.cable_banner, None)
+        elif vbcable.supported() and not self.settings.null_output:
+            self._set_banner(self.cable_banner, *self._cable_banner_content())
         else:
             key = "win32" if sys.platform == "win32" else "darwin" if sys.platform == "darwin" else "linux"
             text, button, url = CABLE_HELP[key]

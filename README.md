@@ -34,7 +34,7 @@ The window shows:
 - latency, buffer, RTT, underruns and lost/late packets;
 - a level meter of what your apps hear.
 
-You can switch the output device and adjust the buffer and gain while streaming. Your choices are remembered. If no virtual cable is installed, a banner links to the download. If no phone has connected after a minute, a firewall hint appears. **Open log folder** shows `phonemic.log`.
+You can switch the output device and adjust the buffer and gain while streaming. Your choices are remembered. If no virtual cable is installed, a banner offers **Install virtual mic** (Windows), which sets up VB-Cable for you (see [below](#windows-vb-cable)). If no phone has connected after a minute, a firewall hint appears. **Open log folder** shows `phonemic.log`.
 
 On macOS and Linux the same window opens with `python -m phonemic.gui` (or `python -m phonemic --gui`).
 
@@ -83,6 +83,7 @@ python -m phonemic [options]
 | `--gain 0` | Output gain in dB, e.g. `--gain 6`. |
 | `--null-output` | Use no audio device. Audio is consumed in real time (for testing). |
 | `--record out.wav` | Also write exactly what is played to a WAV file. |
+| `--install-cable` | Windows: download VB-Cable, open its installer, check the new device, and exit. |
 | `--setup-linux` | Create the `phonemic_mic` virtual microphone (PulseAudio/PipeWire) and exit. |
 | `--config-dir DIR` | Where the certificate and token are stored. |
 | `--new-token` | Generate a new URL token. Old QR codes and bookmarks stop working. |
@@ -116,7 +117,14 @@ The certificate is only regenerated if your LAN IP changes. The window's setting
 
 ### Windows: VB-Cable
 
-1. Download and install VB-Cable from <https://vb-audio.com/Cable/> (run the installer as administrator), then reboot.
+Windows only lists a microphone that comes from an audio driver, and only Microsoft-signed drivers load, so phonemic can't create one itself. It uses VB-Cable, a free (donationware) signed driver by VB-Audio.
+
+1. Install it, using any one of these:
+   - In the window, click **Install virtual mic** on the yellow banner.
+   - Run `python -m phonemic --install-cable`.
+   - Download it from <https://vb-audio.com/Cable/>, unzip it, run `VBCABLE_Setup_x64.exe` as administrator, and click **Install Driver**.
+
+   The first two download the official driver pack from vb-audio.com into `%APPDATA%\phonemic\vbcable`. They check that the setup program is signed by VB-Audio, then open it. Click **Yes** on the Windows admin prompt, then **Install Driver**. VB-Cable's licence doesn't allow it to be built into another installer, so phonemic opens VB-Audio's own setup window rather than installing silently. phonemic then rescans the audio devices and switches to the cable. If Windows hasn't added the device yet, restart Windows. To uninstall, run the same setup program again and click **Remove Driver**.
 2. Run `python -m phonemic`. It automatically plays into **"CABLE Input"**, preferring the low-latency WASAPI version of the device.
 3. In Zoom, Discord, OBS and other apps, choose **"CABLE Output"** as the microphone.
 
@@ -159,6 +167,7 @@ Guest Wi-Fi networks and many public networks block devices from talking to each
 | **High latency** | Lower `--target-ms`, e.g. to 20. Use a WASAPI device on Windows (`--list-devices`; it is chosen automatically when available). Avoid Bluetooth headphones as the monitor output. Leave echo cancellation, noise suppression and auto gain **off** on the phone, because each adds processing delay. |
 | **Mic stops when the screen locks** | Browsers stop the microphone when the page is hidden. Keep the screen on and the page in front. The page uses the Wake Lock API where available. On iPhone you can also set *Settings → Display & Brightness → Auto-Lock → Never* while streaming. When you return to the page, it reconnects automatically. Tap Start again if the system stopped the mic. |
 | **"Microphone permission was denied"** | **iPhone:** *Settings → Safari → Microphone → Allow*, or *aA → Website Settings → Microphone*. **Android Chrome:** tap the lock icon in the address bar, then *Permissions → Microphone*. |
+| **"Couldn't open … so phonemic is using … instead"** | The preferred output wouldn't start, e.g. a monitor's HDMI audio while the monitor sleeps or is on another input. phonemic tries the same device through the other Windows audio systems, then the virtual cable, the default outputs and finally any other output, rather than stopping. Install the virtual cable, or pick a working device in the **Output** list. |
 | Audio too quiet or too loud | Use `--gain 6` or `--gain -6` (dB), or tick *Auto gain control* on the phone. |
 
 ## Tuning `--target-ms`
@@ -195,6 +204,7 @@ pytest
   - late-packet, overrun, concealment and underrun behaviour, and counter wrap-around.
 - `tests/test_e2e.py` starts the real server with `--null-output --record` and connects `tests/fake_phone.py`, which uses the same signalling and data channels as the browser. It then checks that the recording holds a clean 440 Hz tone, and that the tone survives loss and jitter.
 - `tests/test_engine.py` checks the engine behind both front-ends: start/stop/restart, live buffer and gain changes, level metering, status reporting, and a clear error when the port is already in use.
+- `tests/test_vbcable.py` checks the VB-Cable helper: unpacking, rejecting broken downloads, refusing a setup program not signed by VB-Audio, and the window's install flow (offer → progress → switch to the cable, a declined admin prompt, and "restart Windows"). Set `PHONEMIC_NETWORK_TESTS=1` to also download the real pack and check its signature.
 - `tests/test_gui.py` opens the real window, connects the fake phone and checks that the window shows "Connected" with stats. It also moves the sliders, stops the server, and checks that settings are saved and validated.
 
 `scripts/make_icon.py` regenerates the icons in `phonemic/assets/`.

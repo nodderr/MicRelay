@@ -35,6 +35,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gain", type=float, default=0.0, help="output gain in dB (default 0)")
     parser.add_argument("--null-output", action="store_true", help="no audio device (testing)")
     parser.add_argument("--record", type=Path, metavar="OUT.WAV", help="also write what is played to a WAV file")
+    parser.add_argument(
+        "--install-cable", action="store_true",
+        help="Windows: download VB-Cable from vb-audio.com, open its installer, then exit",
+    )
     parser.add_argument("--setup-linux", action="store_true", help="create the phonemic_mic virtual source (pactl) and exit")
     parser.add_argument("--config-dir", type=Path, help="where the certificate and token live")
     parser.add_argument("--new-token", action="store_true", help="generate a new URL token (invalidates old QR codes)")
@@ -112,11 +116,43 @@ def print_banner(url: str, output_description: str) -> None:
     print("  Chrome: Advanced > Proceed). Then tap Start. Press Ctrl+C here to quit.\n", flush=True)
 
 
+def install_cable(config_dir: Path | None) -> int:
+    """--install-cable: fetch VB-Cable and run its setup program."""
+    from . import vbcable
+    from .paths import default_config_dir
+
+    if not vbcable.supported():
+        print(audio_out.virtual_mic_hint())
+        return 1
+    existing = audio_out.auto_select_device()
+    if existing is not None:
+        print(f"A virtual cable is already installed: {existing.name}")
+        return 0
+    print("Downloading VB-Cable (donationware by VB-Audio, www.vb-cable.com) and opening its installer.")
+    print("Click Yes on the Windows prompt, then 'Install Driver' in the VB-Cable window.\n")
+    dest = (config_dir or default_config_dir()) / "vbcable"
+    try:
+        vbcable.install(dest, lambda message: print(f"\r{message:<72}", end="", flush=True))
+    except vbcable.InstallCancelled as exc:
+        print(f"\n{exc}")
+        return 1
+    print()
+    audio_out.refresh_devices()
+    found = audio_out.auto_select_device()
+    if found is None:
+        print("VB-Cable is installed, but Windows hasn't added the device yet. Restart Windows, then start phonemic.")
+        return 0
+    print(f"Ready: phonemic will play into '{found.name}'. In your apps choose 'CABLE Output' as the microphone.")
+    return 0
+
+
 def run_cli(args: argparse.Namespace) -> int:
     engine = Engine(settings_from_args(args))
     engine.start()
     try:
         status = engine.status()
+        if status.output_warning:
+            print(f"\n{status.output_warning}")
         if not status.virtual_device:
             print(f"\n{audio_out.virtual_mic_hint()}\n")
             log.warning("Playing to '%s' for now", status.output_description)
@@ -164,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.setup_linux:
             return audio_out.setup_linux()
+        if args.install_cable:
+            return install_cable(args.config_dir)
         return run_cli(args)
     except KeyboardInterrupt:
         print("\nBye.")

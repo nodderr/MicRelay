@@ -33,6 +33,8 @@ HOSTAPI_PREFERENCE = (
     "mme",
     "windows wdm-ks",
 )
+WDM_KS = "windows wdm-ks"
+MME_NAME_CHARS = 31  # MME truncates device names to this many characters
 LINUX_SINK = "phonemic"
 LINUX_SOURCE = "phonemic_mic"
 LINUX_PULSE_DEVICES = ("pulse", "pipewire", "default")
@@ -119,6 +121,17 @@ def list_output_devices() -> list[DeviceChoice]:
     return devices
 
 
+def refresh_devices() -> None:
+    """Re-scan audio devices, e.g. after installing a cable.
+
+    PortAudio only enumerates devices when it initialises, so this restarts it;
+    no stream may be open while it runs.
+    """
+    sd = import_sounddevice()
+    sd._terminate()
+    sd._initialize()
+
+
 def print_devices() -> None:
     devices = list_output_devices()
     print("Output devices (* = looks like a virtual cable):")
@@ -172,25 +185,67 @@ def auto_select_device() -> DeviceChoice | None:
     return None
 
 
+def _default_output_devices(devices: list[DeviceChoice]) -> list[DeviceChoice]:
+    """Each host API's default output, lowest-latency host API first."""
+    sd = import_sounddevice()
+    by_index = {dev.index: dev for dev in devices}
+    hostapis = sorted(sd.query_hostapis(), key=lambda api: hostapi_rank(api["name"]))
+    found = (by_index.get(api.get("default_output_device", -1)) for api in hostapis)
+    return [dev for dev in found if dev is not None]
+
+
 def default_output_device() -> DeviceChoice:
     """The system default output, via the lowest-latency host API that has one."""
-    sd = import_sounddevice()
-    by_index = {dev.index: dev for dev in list_output_devices()}
-    hostapis = sorted(sd.query_hostapis(), key=lambda api: hostapi_rank(api["name"]))
-    for api in hostapis:
-        dev = by_index.get(api.get("default_output_device", -1))
-        if dev is not None:
-            return dev
-    raise RuntimeError("No default output device found; use --device or --null-output")
+    defaults = _default_output_devices(list_output_devices())
+    if not defaults:
+        raise RuntimeError("No default output device found; use --device or --null-output")
+    return defaults[0]
+
+
+def output_candidates(spec: str | None, fallback: bool = True) -> list[DeviceChoice]:
+    """Output devices to try, best first, so one device that won't open isn't fatal.
+
+    The requested device (or the virtual cable when `spec` is None) comes first,
+    then the same device through the other host APIs (a driver that fails in
+    WASAPI often works through DirectSound or MME). With `fallback`, the virtual
+    cable, the system default outputs and then every other output follow.
+    WDM-KS, the most fragile host API, is only used when `spec` resolves to it.
+    """
+    devices = list_output_devices()
+    ordered: list[DeviceChoice] = []
+
+    def add(dev: DeviceChoice | None) -> None:
+        if dev is not None and all(dev.index != other.index for other in ordered):
+            ordered.append(dev)
+
+    def add_with_alternatives(dev: DeviceChoice | None) -> None:
+        if dev is None:
+            return
+        add(dev)
+        key = dev.name.lower()[:MME_NAME_CHARS]
+        for other in sorted(devices, key=lambda d: (hostapi_rank(d.hostapi), d.index)):
+            if other.name.lower()[:MME_NAME_CHARS] == key and other.hostapi.lower() != WDM_KS:
+                add(other)
+
+    if spec:
+        add_with_alternatives(find_device(spec))  # raises ValueError if nothing matches
+        if not fallback:
+            return ordered
+    add_with_alternatives(auto_select_device())
+    by_rank = sorted(devices, key=lambda d: (hostapi_rank(d.hostapi), d.index))
+    for dev in _default_output_devices(devices) + by_rank:  # defaults, then anything else
+        if dev.hostapi.lower() != WDM_KS:
+            add(dev)
+    return ordered
 
 
 def virtual_mic_hint() -> str:
     """How to install a virtual microphone on this OS."""
     if sys.platform == "win32":
         return (
-            "No virtual cable found. Install VB-Cable (https://vb-audio.com/Cable/), reboot,\n"
-            "then rerun: phonemic plays into 'CABLE Input' and Zoom/Discord/OBS select\n"
-            "'CABLE Output' as their microphone."
+            "No virtual cable found. Run 'python -m phonemic --install-cable' (or install VB-Cable\n"
+            "from https://vb-audio.com/Cable/), then rerun: phonemic plays into 'CABLE Input' and\n"
+            "Zoom/Discord/OBS select 'CABLE Output' as their microphone."
         )
     if sys.platform == "darwin":
         return (
@@ -386,9 +441,11 @@ class SoundDeviceOutput(_BlockRenderer):
             )
             self._stream.start()
         except sd.PortAudioError as exc:
+            if self._stream is not None:  # opened but would not start
+                self._stream.close()
+                self._stream = None
             raise RuntimeError(
-                f"Cannot open output device '{self.device.name}': {exc}. "
-                "Pick another one with --device (see --list-devices)."
+                f"Cannot open output device '{self.device.name}' ({self.device.hostapi}): {exc}"
             ) from exc
         log.info(
             "Audio output started: %s, %d ch, stream latency %.1f ms",

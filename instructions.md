@@ -58,11 +58,16 @@ python3 -m venv .venv
 
 Apps can only choose a "microphone" that the operating system knows about. A virtual cable gives you one: phonemic plays audio into one end, and apps record from the other end.
 
-**Windows: VB-Cable**
+**Windows: VB-Cable (let phonemic do it)**
 
-1. Download VB-Cable from <https://vb-audio.com/Cable/> and unzip it.
-2. Right-click `VBCABLE_Setup_x64.exe` and choose **Run as administrator**, then click **Install Driver**.
-3. **Reboot.**
+1. Start phonemic (Step 5). If no virtual mic is installed yet, a yellow banner appears. Click **Install virtual mic**, then **OK**.
+2. phonemic downloads VB-Cable (free donationware from vb-audio.com) and opens its installer. Click **Yes** on the Windows prompt.
+3. In the VB-Cable window, click **Install Driver**. When it says it's done, click **OK** and close the window.
+4. phonemic switches to the cable by itself and says *"The virtual mic is ready"*. If the banner says *"Restart Windows to finish"* instead, restart, then open phonemic again.
+
+From a terminal, `PY -m phonemic --install-cable` does the same.
+
+To do it by hand: download VB-Cable from <https://vb-audio.com/Cable/>, unzip it, right-click `VBCABLE_Setup_x64.exe`, choose **Run as administrator**, click **Install Driver**, then reboot.
 
 **macOS: BlackHole 2ch**
 
@@ -82,7 +87,7 @@ PY -m phonemic --list-devices
 
 The cable should appear with a `*` next to it. On Windows it shows as **CABLE Input**, and on macOS as **BlackHole 2ch**. On Linux, look for a line saying the `phonemic` sink will be used.
 
-If you use the phonemic window, you can skip this check. Once the window is open (Step 5), the cable appears with a ★ in its **Output** list. If the window says *"No virtual cable found"*, the cable isn't installed yet.
+If you use the phonemic window, you can skip this check. Once the window is open (Step 5), the cable appears with a ★ in its **Output** list. If the window shows the yellow *"No virtual microphone yet"* banner, the cable isn't installed yet.
 
 ---
 
@@ -179,7 +184,8 @@ Options can be combined, for example `PY -m phonemic --target-ms 40 --gain 3`.
 | "Access denied: rescan the QR code" | Scan the QR code currently shown in the terminal. |
 | "Microphone permission was denied" | **iPhone:** Settings → Safari → Microphone → Allow. **Android:** tap the lock icon in the address bar → Permissions → Microphone. |
 | The app hears nothing | Make sure the app's microphone is set to **CABLE Output**, **BlackHole 2ch** or **phonemic_mic**, and that the phone shows **Live** and isn't muted. |
-| "No virtual cable found" | Install the cable (Step 3) and reboot. Until then, phonemic plays to your speakers. |
+| "No virtual microphone yet" / "No virtual cable found" | Install the cable (Step 3). On Windows, click **Install virtual mic** in the window. Until then, phonemic plays to your speakers. |
+| "Installing VB-Cable didn't work" | If you clicked **No** on the Windows prompt, click **Try again**. If the download failed, check your internet connection, or install it by hand (Step 3). |
 | Port 8443 is already in use | Run `PY -m phonemic --port 9443`. |
 
 ---

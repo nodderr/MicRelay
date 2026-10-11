@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import audio_out, netutil
-from .audio_out import DeviceChoice, NullOutput, Output, SoundDeviceOutput, WavRecorder
+from .audio_out import NullOutput, Output, SoundDeviceOutput, WavRecorder
 from .jitter import JitterBuffer, JitterStats
 
 if TYPE_CHECKING:  # the WebRTC stack is imported lazily: it takes seconds to load
@@ -52,6 +52,7 @@ class EngineStatus:
     output_description: str
     output_latency_ms: float
     virtual_device: bool  # True if audio goes to a virtual cable (or null output)
+    output_warning: str | None  # set when the preferred output failed and another is used
     level: float  # peak output level since the previous status() call, 0..1
     uptime_s: float
     error: str | None
@@ -62,17 +63,6 @@ class EngineStatus:
         if self.server is None or self.stats is None or not self.stats.playing:
             return None
         return (self.server.rtt_ms or 0.0) / 2 + self.stats.buffer_ms + self.output_latency_ms
-
-
-def resolve_device(spec: str | None) -> tuple[DeviceChoice, bool]:
-    """Return (device, is_virtual). `spec` None means auto: virtual cable, else default."""
-    if spec:
-        device = audio_out.find_device(spec)
-        return device, device.is_virtual
-    device = audio_out.auto_select_device()
-    if device is not None:
-        return device, True
-    return audio_out.default_output_device(), False
 
 
 def _quiet_ssl_errors(loop: asyncio.AbstractEventLoop, context: dict) -> None:
@@ -93,6 +83,7 @@ class Engine:
         self.jitter: JitterBuffer | None = None
         self.output: Output | None = None
         self.virtual_device = False
+        self.output_warning: str | None = None
         self._server: PhonemicServer | None = None
         self._recorder: WavRecorder | None = None
         self._thread: threading.Thread | None = None
@@ -160,20 +151,18 @@ class Engine:
         token = certs.load_or_create_token(config_dir, regenerate=s.new_token)
         ssl_context = certs.make_ssl_context(cert_path, key_path)
 
-        output, self.virtual_device = self._create_output(s.device)
-        self.output = output
-        self.jitter = JitterBuffer(output.samplerate, s.target_ms)
+        self.jitter = JitterBuffer(NULL_OUTPUT_RATE, s.target_ms)  # rate set by the output
         self._server = PhonemicServer(self.jitter, token)
         try:
             await self._server.start(s.bind, s.port, ssl_context, access_log=s.verbose)
         except OSError as exc:
-            self._close_recorder()
             raise RuntimeError(
                 f"Cannot listen on port {s.port} ({exc.strerror or exc}). "
                 "Is phonemic already running? Otherwise choose another port."
             ) from exc
         try:
-            output.start(self.jitter.pull)
+            with self._output_lock:
+                self.output, self.virtual_device, self.output_warning = self._open_output(s.device)
             self.url = netutil.build_url(host, s.port, token)
             self._started_at = time.monotonic()
             self._ready.set()
@@ -187,22 +176,50 @@ class Engine:
             log.info("Stopped")
 
     # ---------------------------------------------------------------- output
-    def _create_output(self, device_spec: str | None) -> tuple[Output, bool]:
+    def _open_output(self, device_spec: str | None, fallback: bool = True) -> tuple[Output, bool, str | None]:
+        """Start the first output that works: (output, is_virtual, fallback warning).
+
+        `device_spec` None means auto (virtual cable, else the default output).
+        With `fallback`, a device that won't open is skipped for the next
+        candidate instead of stopping phonemic.
+        """
         s = self.settings
+        assert self.jitter is not None
         if s.null_output:
-            if s.record and self._recorder is None:
-                self._recorder = WavRecorder(s.record, NULL_OUTPUT_RATE)
-            return NullOutput(NULL_OUTPUT_RATE, s.gain_db, self._recorder), True
+            output: Output = NullOutput(NULL_OUTPUT_RATE, s.gain_db, self._recorder_for(NULL_OUTPUT_RATE))
+            self.jitter.set_out_rate(output.samplerate)
+            output.start(self.jitter.pull)
+            return output, True, None
         audio_out.prepare_linux_routing()
-        device, is_virtual = resolve_device(device_spec)
+        candidates = audio_out.output_candidates(device_spec, fallback)
+        if not candidates:
+            raise RuntimeError("No audio output device found. Connect speakers or headphones, or install a virtual cable.")
+        errors: list[str] = []
+        for device in candidates:
+            output = SoundDeviceOutput(device, s.gain_db, self._recorder_for(device.samplerate))
+            self.jitter.set_out_rate(device.samplerate)
+            try:
+                output.start(self.jitter.pull)
+            except RuntimeError as exc:
+                log.warning("%s", exc)
+                errors.append(str(exc))
+                continue
+            warning = None
+            if errors:
+                warning = f"Couldn't open {candidates[0].name}, so phonemic is using {device.name} instead."
+                log.warning("%s", warning)
+            return output, device.is_virtual, warning
+        more = f" ({len(errors) - 1} other outputs also failed; see the log)" if len(errors) > 1 else ""
+        raise RuntimeError(errors[0] + more)
+
+    def _recorder_for(self, samplerate: int) -> WavRecorder | None:
+        s = self.settings
         if s.record and self._recorder is None:
-            self._recorder = WavRecorder(s.record, device.samplerate)
-        recorder = self._recorder
-        if recorder is not None and recorder.samplerate != device.samplerate:
+            self._recorder = WavRecorder(s.record, samplerate)
+        if self._recorder is not None and self._recorder.samplerate != samplerate:
             log.warning("Recording stopped: new device runs at a different sample rate")
             self._close_recorder()
-            recorder = None
-        return SoundDeviceOutput(device, s.gain_db, recorder), is_virtual
+        return self._recorder
 
     def _close_recorder(self) -> None:
         if self._recorder is not None:
@@ -213,22 +230,24 @@ class Engine:
         """Switch the output device while running (the phone stays connected)."""
         if self.settings.null_output:
             raise RuntimeError("Cannot change the device in null-output mode")
+        if self.jitter is None:
+            raise RuntimeError("phonemic is not running")
         with self._output_lock:
             old = self.output
-            new, is_virtual = self._create_output(device_spec)
             if old is not None:
                 old.stop()
             try:
-                if self.jitter is not None:
-                    self.jitter.set_out_rate(new.samplerate)
-                    new.start(self.jitter.pull)
+                # Only the chosen device (through any host API): picking a device
+                # should not silently land somewhere else.
+                new, is_virtual, warning = self._open_output(device_spec, fallback=device_spec is None)
             except Exception:
-                if old is not None and self.jitter is not None:
+                if old is not None:
                     self.jitter.set_out_rate(old.samplerate)
                     old.start(self.jitter.pull)
                 raise
             self.output = new
             self.virtual_device = is_virtual
+            self.output_warning = warning
             self.settings = replace(self.settings, device=device_spec)
         log.info("Output switched to %s", new.description)
 
@@ -256,6 +275,7 @@ class Engine:
             output_description=output.description if output is not None else "",
             output_latency_ms=output.latency_s * 1000.0 if output is not None and running else 0.0,
             virtual_device=self.virtual_device,
+            output_warning=self.output_warning,
             level=output.take_peak() if output is not None and running else 0.0,
             uptime_s=time.monotonic() - self._started_at if running else 0.0,
             error=str(error) if error is not None else None,
