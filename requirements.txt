@@ -1,0 +1,7 @@
+aiohttp>=3.9
+aiortc>=1.9
+cryptography>=42
+numpy>=1.24
+qrcode>=7.4
+sounddevice>=0.4.6
+pytest>=7.4

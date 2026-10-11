@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>phonemic</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #181b22; --line: #262a33; --text: #e8eaf0; --muted: #8b92a3;
+    --accent: #3ddc97; --accent-ink: #062b1c; --stop: #ff5d5d; --warn: #ffb547; --info: #6aa8ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh; padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 16px;
+    -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none;
+  }
+  main { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 16px; }
+  header { display: flex; justify-content: space-between; align-items: center; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: .5px; }
+  .pill { font-size: 13px; padding: 4px 10px; border-radius: 999px; background: var(--line); color: var(--muted); }
+  .pill.live { background: rgba(61,220,151,.15); color: var(--accent); }
+  .pill.busy { background: rgba(106,168,255,.15); color: var(--info); }
+  .pill.bad { background: rgba(255,93,93,.15); color: var(--stop); }
+  .pill.warn { background: rgba(255,181,71,.15); color: var(--warn); }
+  #start {
+    align-self: center; width: min(62vw, 240px); aspect-ratio: 1; border-radius: 50%; border: 0;
+    background: var(--accent); color: var(--accent-ink); font-size: 28px; font-weight: 700;
+    box-shadow: 0 0 0 10px rgba(61,220,151,.12); cursor: pointer; touch-action: manipulation;
+  }
+  #start.running { background: var(--stop); color: #2b0606; box-shadow: 0 0 0 10px rgba(255,93,93,.14); }
+  #start:disabled { opacity: .5; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+  .meter { height: 14px; border-radius: 7px; background: var(--line); overflow: hidden; }
+  .meter > div { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent) 70%, var(--warn) 88%, var(--stop)); transition: width 60ms linear; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .label { color: var(--muted); font-size: 13px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; }
+  .stats b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  #mute { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: transparent; color: var(--text); font-size: 16px; }
+  #mute.on { background: rgba(255,181,71,.15); color: var(--warn); border-color: rgba(255,181,71,.4); }
+  #mute:disabled { opacity: .4; }
+  label.opt { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  label.opt input { width: 22px; height: 22px; accent-color: var(--accent); }
+  .note { border-color: rgba(255,181,71,.35); color: var(--warn); font-size: 14px; }
+  #msg { display: none; border-color: rgba(255,93,93,.4); color: #ffb3b3; font-size: 14px; white-space: pre-line; }
+  #msg.show { display: block; }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>phonemic</h1>
+    <span id="state" class="pill">Idle</span>
+  </header>
+
+  <button id="start" type="button">Start</button>
+
+  <div class="panel">
+    <div class="row"><span class="label">Input level</span><span class="label" id="db">-∞ dB</span></div>
+    <div class="meter" style="margin-top:8px"><div id="level"></div></div>
+  </div>
+
+  <div class="panel stats">
+    <div><span class="label">Sample rate</span><b id="rate">–</b></div>
+    <div><span class="label">RTT</span><b id="rtt">–</b></div>
+    <div><span class="label">Chunks sent</span><b id="sent">0</b></div>
+    <div><span class="label">Dropped (congestion)</span><b id="dropped">0</b></div>
+  </div>
+
+  <button id="mute" type="button" disabled>Mute</button>
+
+  <div class="panel">
+    <label class="opt"><input type="checkbox" id="ec"> Echo cancellation</label>
+    <label class="opt"><input type="checkbox" id="ns"> Noise suppression</label>
+    <label class="opt"><input type="checkbox" id="agc"> Auto gain control</label>
+    <small>All off = raw mic, lowest latency. Changing an option restarts the stream.</small>
+  </div>
+
+  <div class="panel note" id="note">Keep this screen on. Locking the phone or switching apps stops the microphone.</div>
+  <div class="panel" id="msg"></div>
+</main>
+
+<script>
+"use strict";
+(() => {
+  // ------------------------------------------------------------------ worklet
+  // Accumulates 128-sample render quanta into 10 ms chunks and packs each as
+  // [uint32 seq LE][uint32 samplePos LE][int16 LE mono samples...].
+  const WORKLET_SRC = `
+  class PhonemicCapture extends AudioWorkletProcessor {
+    constructor(options) {
+      super();
+      this.n = options.processorOptions.chunkSamples;
+      this.buf = new Float32Array(this.n);
+      this.fill = 0; this.seq = 0; this.pos = 0;
+    }
+    process(inputs) {
+      const ch = inputs[0] && inputs[0][0];
+      if (!ch) return true;
+      let i = 0;
+      while (i < ch.length) {
+        const take = Math.min(this.n - this.fill, ch.length - i);
+        this.buf.set(ch.subarray(i, i + take), this.fill);
+        this.fill += take; i += take;
+        if (this.fill === this.n) this.flush();
+      }
+      return true;
+    }
+    flush() {
+      const ab = new ArrayBuffer(8 + this.n * 2);
+      const dv = new DataView(ab);
+      dv.setUint32(0, this.seq >>> 0, true);
+      dv.setUint32(4, this.pos % 4294967296, true);
+      let peak = 0;
+      for (let k = 0; k < this.n; k++) {
+        let s = this.buf[k];
+        if (s > 1) s = 1; else if (s < -1) s = -1;
+        const a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+        dv.setInt16(8 + 2 * k, s < 0 ? s * 32768 : s * 32767, true);
+      }
+      this.port.postMessage({ buf: ab, peak }, [ab]);
+      this.seq = (this.seq + 1) >>> 0;
+      this.pos += this.n;
+      this.fill = 0;
+    }
+  }
+  registerProcessor('phonemic-capture', PhonemicCapture);`;
+
+  // --------------------------------------------------------------------- state
+  const $ = (id) => document.getElementById(id);
+  const ui = {
+    start: $('start'), state: $('state'), mute: $('mute'), level: $('level'), db: $('db'),
+    rate: $('rate'), rtt: $('rtt'), sent: $('sent'), dropped: $('dropped'), msg: $('msg'), note: $('note'),
+    ec: $('ec'), ns: $('ns'), agc: $('agc'),
+  };
+  const token = new URLSearchParams(location.search).get('t') || '';
+  const MAX_BUFFERED = 16 * 1024;      // drop audio rather than queue latency
+  const RECONNECT_DELAYS = [500, 1000, 2000, 3000, 5000];
+
+  let running = false, muted = false;
+  let ctx = null, stream = null, node = null, sink = null;
+  let pc = null, audioCh = null, ctlCh = null;
+  let chunkSamples = 0, sent = 0, dropped = 0, peakHold = 0;
+  let reconnectTimer = null, reconnectAttempt = 0, pingTimer = null, lastPong = 0;
+  let wakeLock = null, connGen = 0;
+
+  // ------------------------------------------------------------------ helpers
+  function setState(text, cls) { ui.state.textContent = text; ui.state.className = 'pill ' + (cls || ''); }
+  function showMsg(text) { ui.msg.textContent = text; ui.msg.classList.toggle('show', !!text); }
+  function setButton() {
+    ui.start.textContent = running ? 'Stop' : 'Start';
+    ui.start.classList.toggle('running', running);
+    ui.mute.disabled = !running;
+    ui.mute.textContent = muted ? 'Unmute' : 'Mute';
+    ui.mute.classList.toggle('on', muted);
+  }
+  function sendCtl(obj) { if (ctlCh && ctlCh.readyState === 'open') ctlCh.send(JSON.stringify(obj)); }
+
+  // ---------------------------------------------------------------- wake lock
+  async function acquireWakeLock() {
+    if (!('wakeLock' in navigator)) {
+      ui.note.textContent = 'Keep this screen on: this browser cannot keep it awake automatically. Locking the phone stops the microphone.';
+      return;
+    }
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } catch (e) { console.warn('wake lock failed', e); }
+  }
+  function releaseWakeLock() { if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; } }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !running) return;
+    if (!wakeLock) acquireWakeLock();
+    if (ctx && ctx.state !== 'running') {
+      ctx.resume().catch(() => {});
+      setTimeout(() => {
+        if (running && ctx && ctx.state !== 'running') showMsg('Audio was paused by the system. Tap Stop, then Start.');
+      }, 500);
+    }
+    if (!pc || ['failed', 'closed', 'disconnected'].includes(pc.connectionState)) scheduleReconnect(0);
+  });
+
+  // -------------------------------------------------------------------- audio
+  function micConstraints() {
+    return {
+      audio: {
+        channelCount: 1,
+        echoCancellation: ui.ec.checked,
+        noiseSuppression: ui.ns.checked,
+        autoGainControl: ui.agc.checked,
+      },
+      video: false,
+    };
+  }
+
+  function createContext() {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error('Web Audio is not supported by this browser.');
+    try { return new AC({ latencyHint: 'interactive', sampleRate: 48000 }); }
+    catch (e) { return new AC({ latencyHint: 'interactive' }); }
+  }
+
+  async function startAudio(context) {
+    stream = await navigator.mediaDevices.getUserMedia(micConstraints());
+    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
+    try { await context.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    chunkSamples = Math.round(context.sampleRate / 100);
+    const source = context.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(context, 'phonemic-capture', {
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+      channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'speakers',
+      processorOptions: { chunkSamples },
+    });
+    node.port.onmessage = onChunk;
+    sink = context.createGain();
+    sink.gain.value = 0;                 // keep the graph pulled but silent
+    source.connect(node); node.connect(sink); sink.connect(context.destination);
+    ui.rate.textContent = context.sampleRate + ' Hz';
+    stream.getAudioTracks().forEach((t) => {
+      t.onended = () => { if (running) { stop(false); showMsg('The system stopped the microphone (screen locked or another app took it). Tap Start.'); } };
+    });
+  }
+
+  function onChunk(ev) {
+    const { buf, peak } = ev.data;
+    if (peak > peakHold) peakHold = peak;
+    if (muted || !audioCh || audioCh.readyState !== 'open') return;
+    if (audioCh.bufferedAmount > MAX_BUFFERED) { dropped++; return; }
+    try { audioCh.send(buf); sent++; } catch (e) { dropped++; }
+  }
+
+  function meterLoop() {
+    const db = peakHold > 0 ? 20 * Math.log10(peakHold) : -Infinity;
+    const pct = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+    ui.level.style.width = (running ? pct : 0) + '%';
+    ui.db.textContent = isFinite(db) && running ? db.toFixed(0) + ' dB' : '-∞ dB';
+    ui.sent.textContent = sent; ui.dropped.textContent = dropped;
+    peakHold *= 0.85;
+    requestAnimationFrame(meterLoop);
+  }
+
+  // ------------------------------------------------------------------- WebRTC
+  function waitIceGathering(peer) {
+    return new Promise((resolve) => {
+      if (peer.iceGatheringState === 'complete') return resolve();
+      const timer = setTimeout(resolve, 2500);
+      peer.addEventListener('icegatheringstatechange', () => {
+        if (peer.iceGatheringState === 'complete') { clearTimeout(timer); resolve(); }
+      });
+    });
+  }
+
+  function closePeer() {
+    clearInterval(pingTimer); pingTimer = null;
+    if (pc) { try { pc.close(); } catch (e) {} }
+    pc = audioCh = ctlCh = null;
+  }
+
+  async function connect() {
+    const gen = ++connGen;
+    closePeer();
+    setState(reconnectAttempt ? 'Reconnecting…' : 'Connecting…', 'busy');
+    const peer = new RTCPeerConnection({ iceServers: [] });
+    pc = peer;
+    audioCh = peer.createDataChannel('audio', { ordered: false, maxRetransmits: 0 });
+    audioCh.binaryType = 'arraybuffer';
+    ctlCh = peer.createDataChannel('ctl');
+    ctlCh.onopen = () => onCtlOpen(gen);
+    ctlCh.onmessage = onCtlMessage;
+    ctlCh.onclose = () => { if (gen === connGen && running) scheduleReconnect(); };
+    peer.onconnectionstatechange = () => {
+      if (gen !== connGen) return;
+      const s = peer.connectionState;
+      if (s === 'failed' || s === 'closed' || s === 'disconnected') { if (running) scheduleReconnect(); }
+    };
+
+    await peer.setLocalDescription(await peer.createOffer());
+    await waitIceGathering(peer);
+    if (gen !== connGen) return;
+    const res = await fetch('offer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: peer.localDescription.sdp, type: peer.localDescription.type, token }),
+    });
+    if (res.status === 403) { const e = new Error('Access denied: rescan the QR code shown on the laptop.'); e.fatal = true; throw e; }
+    if (!res.ok) throw new Error('Server error ' + res.status);
+    const answer = await res.json();
+    if (gen !== connGen) return;
+    await peer.setRemoteDescription(answer);
+  }
+
+  function onCtlOpen(gen) {
+    if (gen !== connGen) return;
+    reconnectAttempt = 0;
+    showMsg('');
+    sendCtl({ type: 'hello', sampleRate: ctx.sampleRate, chunkSamples, userAgent: navigator.userAgent });
+    if (muted) sendCtl({ type: 'mute', muted: true });
+    setState(muted ? 'Muted' : 'Live', muted ? 'warn' : 'live');
+    lastPong = performance.now();
+    pingTimer = setInterval(() => {
+      sendCtl({ type: 'ping', t: performance.now() });
+      if (performance.now() - lastPong > 5000 && running) scheduleReconnect(0);
+    }, 1000);
+  }
+
+  function onCtlMessage(ev) {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'ping') sendCtl({ type: 'pong', t: m.t });
+    else if (m.type === 'pong') {
+      lastPong = performance.now();
+      if (typeof m.t === 'number') ui.rtt.textContent = (performance.now() - m.t).toFixed(0) + ' ms';
+    } else if (m.type === 'replaced') {
+      stop(false); showMsg('Another phone connected to the laptop and took over.');
+    } else if (m.type === 'bye') {
+      setState('Laptop stopped', 'warn');
+    }
+  }
+
+  function scheduleReconnect(delay) {
+    if (!running || reconnectTimer) return;
+    connGen++;                           // invalidate callbacks of the old connection
+    closePeer();
+    const wait = delay !== undefined ? delay : RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)];
+    reconnectAttempt++;
+    setState('Reconnecting…', 'busy');
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      if (!running) return;
+      try { await connect(); }
+      catch (e) { handleConnectError(e); }
+    }, wait);
+  }
+
+  function handleConnectError(e) {
+    console.warn(e);
+    if (e && e.fatal) { stop(false); setState('Error', 'bad'); showMsg(e.message); return; }
+    showMsg('Cannot reach the laptop (' + (e && e.message || e) + '). Retrying…\nIs phonemic still running and the phone on the same Wi-Fi?');
+    scheduleReconnect();
+  }
+
+  // ------------------------------------------------------------- start / stop
+  async function start() {
+    showMsg('');
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setState('Error', 'bad');
+      showMsg('Microphone access needs HTTPS. Open the https:// URL from the QR code.');
+      return;
+    }
+    if (!window.RTCPeerConnection) { setState('Error', 'bad'); showMsg('WebRTC is not supported by this browser.'); return; }
+    if (!token) { setState('Error', 'bad'); showMsg('Missing access token. Open this page by scanning the QR code on the laptop.'); return; }
+
+    // iOS: the AudioContext must be created and resumed synchronously inside the tap.
+    let context;
+    try { context = createContext(); } catch (e) { setState('Error', 'bad'); showMsg(e.message); return; }
+    const resumed = context.resume();
+    if (!context.audioWorklet || typeof AudioWorkletNode === 'undefined') {
+      context.close();
+      setState('Error', 'bad');
+      showMsg('AudioWorklet is not supported. Update to iOS 14.5+ / a current Chrome.');
+      return;
+    }
+    ctx = context;
+    running = true; sent = 0; dropped = 0; reconnectAttempt = 0;
+    setButton();
+    setState('Starting…', 'busy');
+    acquireWakeLock();
+    try {
+      await startAudio(context);
+      await resumed;
+    } catch (e) {
+      const denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+      stop(false);
+      setState(denied ? 'Mic blocked' : 'Error', 'bad');
+      showMsg(denied
+        ? 'Microphone permission was denied.\niPhone: Settings > Safari > Microphone > Allow (or aA > Website Settings).\nAndroid: tap the lock icon in the address bar > Permissions > Microphone.'
+        : 'Could not start the microphone: ' + (e && e.message || e));
+      return;
+    }
+    ctx.onstatechange = () => {
+      if (running && ctx && ctx.state !== 'running') setState('Audio paused', 'warn');
+      else if (running && ctlCh && ctlCh.readyState === 'open') setState(muted ? 'Muted' : 'Live', muted ? 'warn' : 'live');
+    };
+    try { await connect(); } catch (e) { handleConnectError(e); }
+  }
+
+  function stop(notify) {
+    if (notify !== false) sendCtl({ type: 'stop' });
+    running = false;
+    connGen++;
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    closePeer();
+    if (node) { node.port.onmessage = null; try { node.disconnect(); } catch (e) {} node = null; }
+    if (stream) { stream.getTracks().forEach((t) => { t.onended = null; t.stop(); }); stream = null; }
+    if (ctx) { ctx.onstatechange = null; ctx.close().catch(() => {}); ctx = null; }
+    releaseWakeLock();
+    setButton();
+    setState('Idle');
+    ui.rtt.textContent = '–';
+  }
+
+  ui.start.addEventListener('click', () => { if (running) stop(); else start(); });
+  ui.mute.addEventListener('click', () => {
+    muted = !muted;
+    sendCtl({ type: 'mute', muted });
+    setButton();
+    if (ctlCh && ctlCh.readyState === 'open') setState(muted ? 'Muted' : 'Live', muted ? 'warn' : 'live');
+  });
+  [ui.ec, ui.ns, ui.agc].forEach((box) => box.addEventListener('change', () => {
+    if (running) { stop(); start(); }   // change events carry the tap's user activation
+  }));
+  window.addEventListener('pagehide', () => { if (running) sendCtl({ type: 'stop' }); });
+
+  setButton();
+  requestAnimationFrame(meterLoop);
+  if (!token) showMsg('Missing access token. Open this page by scanning the QR code on the laptop.');
+})();
+</script>
+</body>
+</html>
